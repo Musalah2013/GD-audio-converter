@@ -1,14 +1,12 @@
 
-# app_service_account_upload_v2.py
-# Streamlit: Google Drive Audio Converter — Service Account JSON Upload (V2, refactored)
+# app_service_account_upload_nodwd.py
+# Streamlit: Google Drive Audio Converter — Upload Service Account (No DWD)
 #
-# Key improvements over previous version:
-# - Stronger structure: DriveClient class + Retry logic (exponential backoff) for 403/429/5xx
-# - Clear validation and actionable error messages
-# - Per-file live progress/status with concise event log
-# - Safer handling of uploaded JSON (in-memory only), no disk persistence by the app
-# - Optional creation of output subfolder inside selected output folder
-# - CSV summary with additional metrics (success %, total DL/UL size, total time)
+# - Upload a Service Account JSON key each session (kept in memory only)
+# - NO Domain-Wide Delegation (no impersonation)
+# - Share Drive folders/files with the SA's client_email for access
+# - Robust retries, download validation, and thread-safe logging
+# - Uses imageio-ffmpeg (no local system install)
 #
 import os
 import io
@@ -17,6 +15,10 @@ import json
 import math
 import tempfile
 import logging
+import threading
+import collections
+import random
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
@@ -29,10 +31,10 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
+from google.auth.transport.requests import Request
+from google.auth import exceptions as ga_exceptions
 
 import imageio_ffmpeg
-import subprocess
-import random
 
 # ---------------------------
 # Constants & Logging
@@ -48,13 +50,13 @@ AUDIO_FORMATS = {
     "M4A":  {"ext": "m4a",  "mime": "audio/mp4",  "ffmpeg_args": ["-codec:a", "aac"]},
     "OGG":  {"ext": "ogg",  "mime": "audio/ogg",  "ffmpeg_args": ["-codec:a", "libvorbis"]},
     "FLAC": {"ext": "flac", "mime": "audio/flac","ffmpeg_args": ["-codec:a", "flac"]},
-    "WAV":  {"ext": "wav",  "mime": "audio/wav", "ffmpeg_args": ["-codec:a", "pcm_s16le"]},
+    "WAV":  {"ext": "wav",  "mime": "audio/wav",  "ffmpeg_args": ["-codec:a", "pcm_s16le"]},
 }
 BITRATES = ["32", "64", "96", "128", "192", "256", "320"]
 SAMPLE_RATES = ["Auto", "22050", "32000", "44100", "48000"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("drive-audio-converter-v2")
+logger = logging.getLogger("drive-audio-converter-nodwd")
 
 # ---------------------------
 # Utilities
@@ -91,11 +93,28 @@ def ffmpeg_convert(in_path: str, out_path: str, bitrate_kbps: int, sample_rate: 
         cmd.extend(["-ar", str(sample_rate)])
     cmd.append(out_path)
     try:
-        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
         return True, ""
     except subprocess.CalledProcessError as e:
         logger.error("ffmpeg failed: %s", e.stderr)
         return False, e.stderr or "ffmpeg error"
+
+# ---------------------------
+# Thread-safe logging (no Streamlit in worker threads)
+# ---------------------------
+LOG_BUF_MAX = 500
+_log_lock = threading.Lock()
+_log_buf = collections.deque(maxlen=LOG_BUF_MAX)
+
+def log_threadsafe(msg: str):
+    with _log_lock:
+        _log_buf.append(f"{datetime.now().strftime('%H:%M:%S')} — {msg}")
+
+def drain_logs():
+    with _log_lock:
+        items = list(_log_buf)
+        _log_buf.clear()
+    return items
 
 # ---------------------------
 # Drive Client with Retry
@@ -144,6 +163,7 @@ class DriveClient:
 
     def ensure_subfolder(self, parent_id: Optional[str], name: str) -> Optional[str]:
         """Create (or find) a subfolder under parent_id or root if None."""
+        # Escape single quotes in the name safely
         safe_name = name.replace("'", "\\'")
         q = f"mimeType='application/vnd.google-apps.folder' and trashed=false and name='{safe_name}'"
         if parent_id:
@@ -201,38 +221,37 @@ class DriveClient:
             logger.exception("list_audio_files error: %s", e)
         return files
 
-    
-def download_to_temp(self, file_id: str) -> str:
-    """
-    Download file to a NamedTemporaryFile and return its path.
-    - Sets acknowledgeAbuse=True to allow downloading flagged binaries (common for media).
-    - Verifies non-empty result.
-    - Detects obvious HTML/JSON error payloads to surface permission/abuse issues.
-    - Retries with exponential backoff via _with_retry.
-    """
-    req = self.service.files().get_media(fileId=file_id, supportsAllDrives=True, acknowledgeAbuse=True)
-    tmp = tempfile.NamedTemporaryFile(delete=False, prefix="dl_", suffix=".bin")
-    fh = tmp.file
-    downloader = MediaIoBaseDownload(fh, req, chunksize=2 * 1024 * 1024)
-    done = False
-    last_status = None
-    while not done:
-        def next_chunk():
-            return downloader.next_chunk()
-        last_status, done = self._with_retry(next_chunk)
-    fh.flush(); fh.close()
+    def download_to_temp(self, file_id: str) -> str:
+        """
+        Download file to a NamedTemporaryFile and return its path.
+        - Sets acknowledgeAbuse=True to allow downloading flagged binaries (common for media).
+        - Verifies non-empty result.
+        - Detects obvious HTML/JSON error payloads to surface permission/abuse issues.
+        - Retries with exponential backoff via _with_retry.
+        """
+        req = self.service.files().get_media(fileId=file_id, supportsAllDrives=True, acknowledgeAbuse=True)
+        tmp = tempfile.NamedTemporaryFile(delete=False, prefix="dl_", suffix=".bin")
+        fh = tmp.file
+        downloader = MediaIoBaseDownload(fh, req, chunksize=2 * 1024 * 1024)
+        done = False
+        last_status = None
+        while not done:
+            def next_chunk():
+                return downloader.next_chunk()
+            last_status, done = self._with_retry(next_chunk)
+        fh.flush(); fh.close()
 
-    # Validate non-empty
-    if not os.path.exists(tmp.name) or os.path.getsize(tmp.name) <= 0:
-        raise RuntimeError("Download produced an empty file. Check permissions or file health.")
+        # Validate non-empty
+        if not os.path.exists(tmp.name) or os.path.getsize(tmp.name) <= 0:
+            raise RuntimeError("Download produced an empty file. Check sharing permissions or file health.")
 
-    # Heuristic: detect HTML/JSON error payload (instead of audio bytes)
-    with open(tmp.name, "rb") as f:
-        head = f.read(1024).strip().lower()
-    if head.startswith(b'<!doctype html') or head.startswith(b'<html') or head.startswith(b'{') or head.startswith(b'['):
-        raise RuntimeError("Downloaded content is not audio (looks like an error page or JSON). The Service Account may lack access to the file content.")
+        # Heuristic: detect HTML/JSON error payload (instead of audio bytes)
+        with open(tmp.name, "rb") as f:
+            head = f.read(1024).strip().lower()
+        if head.startswith(b'<!doctype html') or head.startswith(b'<html') or head.startswith(b'{') or head.startswith(b'['):
+            raise RuntimeError("Downloaded content is not audio (looks like an error page or JSON). Share the file with this Service Account.")
 
-    return tmp.name
+        return tmp.name
 
     def upload_file(self, local_path: str, dest_name: str, mime_type: str, parent_id: Optional[str]) -> Optional[str]:
         meta = {"name": dest_name}
@@ -253,32 +272,40 @@ def download_to_temp(self, file_id: str) -> str:
 # ---------------------------
 # Streamlit UI
 # ---------------------------
-st.set_page_config(page_title="Drive Audio Converter (Upload SA v2)", page_icon="🗝️", layout="wide")
-st.title("🗝️ Google Drive Audio Converter — Upload Service Account JSON (v2)")
-st.caption("Upload a Service Account key each session. No local installs. No secrets file.")
+st.set_page_config(page_title="Drive Audio Converter (Service Account, No DWD)", page_icon="🗝️", layout="wide")
+st.title("🗝️ Google Drive Audio Converter — Upload Service Account (No DWD)")
+st.caption("Upload a Service Account key each session. Share your Drive items with the SA’s client_email. No impersonation.")
 
 with st.expander("🔐 Upload Service Account JSON", expanded=True):
     sa_file = st.file_uploader("Service Account JSON key", type=["json"])
-    use_dwd = st.checkbox("Use Domain‑Wide Delegation (impersonate a user)?", value=False,
-                          help="Requires Workspace admin configuration for DWD.")
-    subject = st.text_input("Impersonated user email (only if using DWD)", value="", disabled=not use_dwd)
     if st.button("Build Drive client", type="primary"):
         if not sa_file:
             st.error("Please upload a Service Account JSON file.")
         else:
             try:
                 info = json.loads(sa_file.read().decode("utf-8"))
+                if info.get("type") != "service_account":
+                    st.error("This JSON is not a Service Account key. Please upload the SA key from Google Cloud (type='service_account').")
+                    st.stop()
                 creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-                if use_dwd:
-                    if not subject.strip():
-                        st.error("Provide an email to impersonate when using DWD.")
-                        st.stop()
-                    creds = creds.with_subject(subject.strip())
+
+                # Preflight token acquisition to fail fast with clear message
+                try:
+                    creds.refresh(Request())
+                except ga_exceptions.RefreshError as e:
+                    st.error(
+                        "Could not obtain an access token for this Service Account.\n\n"
+                        "• Ensure the **Google Drive API** is enabled for the project that owns this Service Account.\n"
+                        "• Since this build has **no DWD**, you must **share** the Drive folders/files with the SA’s client_email.\n"
+                        "• Check server time/clock skew and that the key is valid.\n\n"
+                        f"Details: {e}"
+                    )
+                    st.stop()
+
                 service = build("drive", "v3", credentials=creds, cache_discovery=False)
                 st.session_state["drive_client"] = DriveClient(service)
                 st.session_state["sa_email"] = info.get("client_email", "(unknown)")
-                st.session_state["impersonated"] = subject.strip() if use_dwd else None
-                st.success(f"Authenticated as **{st.session_state['sa_email']}**" + (f" — impersonating **{st.session_state['impersonated']}**" if use_dwd else ""))
+                st.success(f"Authenticated as **{st.session_state['sa_email']}**")
             except Exception as e:
                 st.error(f"Failed to build Drive client: {e}")
 
@@ -294,7 +321,7 @@ client: DriveClient = st.session_state["drive_client"]
 st.subheader("📁 Choose Input & Output Folders")
 left, right = st.columns(2)
 with left:
-    input_url = st.text_input("Input Folder URL or ID (must be accessible to this SA / impersonated user)")
+    input_url = st.text_input("Input Folder URL or ID (must be shared with this Service Account)")
     input_id = extract_folder_id(input_url) if input_url.strip() else None
     if input_id:
         if client.is_folder(input_id):
@@ -303,7 +330,7 @@ with left:
             st.error("Provided input is not a folder or not accessible.")
             input_id = None
 with right:
-    output_url = st.text_input("Output Folder URL or ID (leave blank to save in Drive root)")
+    output_url = st.text_input("Output Folder URL or ID (leave blank to save in Drive root that the SA can write to)")
     output_id = extract_folder_id(output_url) if output_url.strip() else None
     if output_id:
         if client.is_folder(output_id):
@@ -312,7 +339,8 @@ with right:
             st.error("Provided output is not a folder or not accessible.")
             output_id = None
 
-subfolder_name = st.text_input("(Optional) Create or use subfolder inside the output folder", value="")
+# Optional: create subfolder
+subfolder_name = st.text_input("(Optional) Create/use subfolder inside the output folder", value="")
 if subfolder_name and output_id:
     if st.button("Ensure output subfolder exists / select it"):
         sub_id = client.ensure_subfolder(output_id, subfolder_name.strip())
@@ -328,7 +356,7 @@ if subfolder_name and output_id:
 st.subheader("🎵 Select Files to Convert")
 files = client.list_audio_files(input_id)
 if not files:
-    st.warning("No audio files found. Ensure the folder is shared with the Service Account (or DWD is configured).")
+    st.warning("No audio files found. Ensure the folder/files are **shared with this Service Account**.")
     selected_files = []
 else:
     labels = [f"{f['name']}  ({human_bytes(int(f.get('size', 0) or 0))})" for f in files]
@@ -366,11 +394,14 @@ table_placeholder = st.empty()
 log_box = st.expander("Live log", expanded=False)
 report_placeholder = st.empty()
 
-def log(msg: str):
+def render_logs():
+    lines = drain_logs()
+    if not lines:
+        return
     with log_box:
-        st.write(f"{datetime.now().strftime('%H:%M:%S')} — {msg}")
+        for line in lines:
+            st.write(line)
 
-from dataclasses import dataclass
 @dataclass
 class Row:
     id: str
@@ -387,13 +418,13 @@ def convert_one(finfo: Dict[str, Any]) -> Row:
     fname = finfo["name"]
     orig_size = int(finfo.get("size", 0) or 0)
     if orig_size <= 0:
-        return Row(finfo["id"], finfo["name"], "Skipped (empty size)", 0, 0, 0.0, "Drive reported size=0; cannot convert.")
+        return Row(fid, fname, "Skipped (empty size)", 0, 0, 0.0, "Drive reported size=0; cannot convert.")
     dl_path = ""
     try:
-        log(f"⬇️ Downloading: {fname}")
+        log_threadsafe(f"⬇️ Downloading: {fname}")
         dl_path = client.download_to_temp(fid)
 
-        log(f"🎛️ Converting: {fname}")
+        log_threadsafe(f"🎛️ Converting: {fname}")
         stem = os.path.splitext(fname)[0]
         out_ext = AUDIO_FORMATS[out_fmt]["ext"]
         target = os.path.join(tempfile.gettempdir(), f"{stem}_converted.{out_ext}")
@@ -403,19 +434,17 @@ def convert_one(finfo: Dict[str, Any]) -> Row:
 
         up_size = os.path.getsize(target)
         new_name = f"{stem}_converted.{out_ext}"
-        log(f"⬆️ Uploading: {new_name}")
+        log_threadsafe(f"⬆️ Uploading: {new_name}")
         uploaded_id = client.upload_file(target, new_name, AUDIO_FORMATS[out_fmt]["mime"], output_id)
         if not uploaded_id:
             return Row(fid, fname, "Upload Failed", orig_size, up_size, time.time() - t0, "Upload error")
         return Row(fid, fname, "Success", orig_size, up_size, time.time() - t0, "")
     except Exception as e:
-        return Row(fid, fname, f"Error", orig_size, 0, time.time() - t0, str(e))
+        return Row(fid, fname, "Error", orig_size, 0, time.time() - t0, str(e))
     finally:
         if dl_path and os.path.exists(dl_path):
-            try:
-                os.remove(dl_path)
-            except Exception:
-                pass
+            try: os.remove(dl_path)
+            except Exception: pass
 
 if st.button("Start conversion", type="primary", disabled=not selected_files):
     total = len(selected_files)
@@ -448,6 +477,7 @@ if st.button("Start conversion", type="primary", disabled=not selected_files):
                      "error": x.error}
                 for x in rows])
                 table_placeholder.dataframe(df, width='stretch')
+                render_logs()  # flush logs after each completion
 
         elapsed = time.time() - t_all
         pct = (success_count / total * 100.0) if total else 0.0
@@ -466,12 +496,14 @@ if st.button("Start conversion", type="primary", disabled=not selected_files):
             mime="text/csv"
         )
 
+# Final log flush
+render_logs()
+
 st.divider()
 with st.expander("ℹ️ Tips & Notes"):
     st.markdown("""
-- **Upload SA JSON**: Key is used in-memory for this session only.
-- **DWD**: If your Workspace admin enabled **Domain‑Wide Delegation**, provide the email to impersonate.
-- **Shared Drives**: Ensure the SA (or impersonated user) has permissions on the specific drive/folder.
-- **Retries**: The app retries transient Drive API errors (403/429/5xx) with exponential backoff.
-- **FFmpeg**: Uses a portable binary via `imageio-ffmpeg`. No system install required.
+- **This build has NO Domain-Wide Delegation.** You must **share** your Drive folders/files with the Service Account’s **client_email**.
+- Ensure **Google Drive API** is enabled in your GCP project.
+- App uses retries for transient Drive API errors and validates downloads to avoid feeding bad data to ffmpeg.
+- FFmpeg is provided via `imageio-ffmpeg` (portable binary). No system install required.
 """)

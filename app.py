@@ -1,18 +1,26 @@
 
-# app_service_account_upload_nodwd.py
-# Streamlit: Google Drive Audio Converter — Upload Service Account (No DWD)
+# app_fast_nodwd.py
+# Google Drive Audio Converter — Service Account upload (NO DWD) + FAST downloads
 #
-# - Upload a Service Account JSON key each session (kept in memory only)
-# - NO Domain-Wide Delegation (no impersonation)
-# - Share Drive folders/files with the SA's client_email for access
-# - Robust retries, download validation, and thread-safe logging
-# - Uses imageio-ffmpeg (no local system install)
+# Key traits:
+# - Upload a Service Account JSON each session (type: service_account). No impersonation.
+# - FAST downloads via google.auth.transport.requests.AuthorizedSession + alt=media + large chunks + resume.
+# - Robust retries (403/429/5xx) with exponential backoff.
+# - Safer downloads: acknowledgeAbuse, non-empty checks, and error-payload sniffing.
+# - Thread-safe logging (no Streamlit calls inside worker threads).
+# - Streamlit deprecation fixed: use width='stretch' (not use_container_width).
+# - Crash mitigation: avoid pyarrow path by forcing legacy dataframe serialization.
+#
+# RUN TIP (containers): add flag to avoid native file-watcher issues:
+#   streamlit run app_fast_nodwd.py --server.fileWatcherType=none --server.headless=true
 #
 import os
+# Crash mitigation: disable Arrow-based serialization to avoid pyarrow native crashes in some images.
+os.environ.setdefault("STREAMLIT_DATAFRAME_SERIALIZATION", "legacy")
+
 import io
 import time
 import json
-import math
 import tempfile
 import logging
 import threading
@@ -23,16 +31,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import os
-os.environ["STREAMLIT_DATAFRAME_SERIALIZATION"] = "legacy"  # avoid importing pyarrow
+
 import streamlit as st
 import pandas as pd
 
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
-from google.auth.transport.requests import Request
+from google.auth.transport.requests import Request, AuthorizedSession
 from google.auth import exceptions as ga_exceptions
 
 import imageio_ffmpeg
@@ -57,7 +64,7 @@ BITRATES = ["32", "64", "96", "128", "192", "256", "320"]
 SAMPLE_RATES = ["Auto", "22050", "32000", "44100", "48000"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("drive-audio-converter-nodwd")
+logger = logging.getLogger("drive-audio-converter-fast")
 
 # ---------------------------
 # Utilities
@@ -118,7 +125,7 @@ def drain_logs():
     return items
 
 # ---------------------------
-# Drive Client with Retry
+# Drive Client with Retry + FAST download
 # ---------------------------
 @dataclass
 class RetryPolicy:
@@ -127,8 +134,9 @@ class RetryPolicy:
     jitter: float = 0.3
 
 class DriveClient:
-    def __init__(self, service, retry: RetryPolicy = RetryPolicy()):
+    def __init__(self, service, authed_session: AuthorizedSession, retry: RetryPolicy = RetryPolicy()):
         self.service = service
+        self.authed = authed_session
         self.retry = retry
 
     def _with_retry(self, func, *args, **kwargs):
@@ -163,8 +171,6 @@ class DriveClient:
             return False
 
     def ensure_subfolder(self, parent_id: Optional[str], name: str) -> Optional[str]:
-        """Create (or find) a subfolder under parent_id or root if None."""
-        # Escape single quotes in the name safely
         safe_name = name.replace("'", "\\'")
         q = f"mimeType='application/vnd.google-apps.folder' and trashed=false and name='{safe_name}'"
         if parent_id:
@@ -222,37 +228,58 @@ class DriveClient:
             logger.exception("list_audio_files error: %s", e)
         return files
 
-    def download_to_temp(self, file_id: str) -> str:
+    def download_to_temp(self, file_id: str, chunk_bytes: int = 8 * 1024 * 1024) -> str:
         """
-        Download file to a NamedTemporaryFile and return its path.
-        - Sets acknowledgeAbuse=True to allow downloading flagged binaries (common for media).
-        - Verifies non-empty result.
-        - Detects obvious HTML/JSON error payloads to surface permission/abuse issues.
-        - Retries with exponential backoff via _with_retry.
+        FAST streaming download via AuthorizedSession + alt=media.
+        - Large chunks (default 8 MiB) for throughput
+        - Resume support (HTTP Range) if a partial temp file exists
+        - supportsAllDrives + acknowledgeAbuse
+        - Post-download sanity checks (non-empty, not HTML/JSON error)
         """
-        req = self.service.files().get_media(fileId=file_id, supportsAllDrives=True, acknowledgeAbuse=True)
+        if self.authed is None:
+            raise RuntimeError("AuthorizedSession missing")
+
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
+        params = {
+            "alt": "media",
+            "supportsAllDrives": "true",
+            "acknowledgeAbuse": "true",
+        }
+
+        # temp file path (supports resume if partially present)
         tmp = tempfile.NamedTemporaryFile(delete=False, prefix="dl_", suffix=".bin")
-        fh = tmp.file
-        downloader = MediaIoBaseDownload(fh, req, chunksize=2 * 1024 * 1024)
-        done = False
-        last_status = None
-        while not done:
-            def next_chunk():
-                return downloader.next_chunk()
-            last_status, done = self._with_retry(next_chunk)
-        fh.flush(); fh.close()
+        tmp_path = tmp.name
+        tmp.close()
+
+        existing = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+        headers = {}
+        if existing > 0:
+            headers["Range"] = f"bytes={existing}-"  # resume
+
+        def do_get():
+            return self.authed.get(url, params=params, headers=headers, stream=True, timeout=60)
+
+        resp = self._with_retry(do_get)
+        if not getattr(resp, "ok", False):
+            resp.raise_for_status()
+
+        mode = "ab" if existing > 0 else "wb"
+        with open(tmp_path, mode) as fh:
+            for chunk in resp.iter_content(chunk_size=chunk_bytes):
+                if chunk:
+                    fh.write(chunk)
 
         # Validate non-empty
-        if not os.path.exists(tmp.name) or os.path.getsize(tmp.name) <= 0:
+        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) <= 0:
             raise RuntimeError("Download produced an empty file. Check sharing permissions or file health.")
 
-        # Heuristic: detect HTML/JSON error payload (instead of audio bytes)
-        with open(tmp.name, "rb") as f:
+        # Heuristic: detect HTML/JSON error payload
+        with open(tmp_path, "rb") as f:
             head = f.read(1024).strip().lower()
         if head.startswith(b'<!doctype html') or head.startswith(b'<html') or head.startswith(b'{') or head.startswith(b'['):
-            raise RuntimeError("Downloaded content is not audio (looks like an error page or JSON). Share the file with this Service Account.")
+            raise RuntimeError("Downloaded content is not audio (error/HTML/JSON). Share the file with this Service Account.")
 
-        return tmp.name
+        return tmp_path
 
     def upload_file(self, local_path: str, dest_name: str, mime_type: str, parent_id: Optional[str]) -> Optional[str]:
         meta = {"name": dest_name}
@@ -273,12 +300,13 @@ class DriveClient:
 # ---------------------------
 # Streamlit UI
 # ---------------------------
-st.set_page_config(page_title="Drive Audio Converter (Service Account, No DWD)", page_icon="🗝️", layout="wide")
-st.title("🗝️ Google Drive Audio Converter — Upload Service Account (No DWD)")
-st.caption("Upload a Service Account key each session. Share your Drive items with the SA’s client_email. No impersonation.")
+st.set_page_config(page_title="Drive Audio Converter (Fast, SA, No DWD)", page_icon="🗝️", layout="wide")
+st.title("🗝️ Google Drive Audio Converter — Fast (Service Account, No DWD)")
+st.caption("Upload a Service Account key. Share Drive items with its client_email. No impersonation.")
 
 with st.expander("🔐 Upload Service Account JSON", expanded=True):
     sa_file = st.file_uploader("Service Account JSON key", type=["json"])
+    chunk_mib = st.slider("Download chunk size (MiB)", 1, 64, 8, help="Larger chunks can be faster but use more memory.")
     if st.button("Build Drive client", type="primary"):
         if not sa_file:
             st.error("Please upload a Service Account JSON file.")
@@ -297,15 +325,17 @@ with st.expander("🔐 Upload Service Account JSON", expanded=True):
                     st.error(
                         "Could not obtain an access token for this Service Account.\n\n"
                         "• Ensure the **Google Drive API** is enabled for the project that owns this Service Account.\n"
-                        "• Since this build has **no DWD**, you must **share** the Drive folders/files with the SA’s client_email.\n"
+                        "• This build has **no DWD**: you must **share** the Drive folders/files with the SA’s client_email.\n"
                         "• Check server time/clock skew and that the key is valid.\n\n"
                         f"Details: {e}"
                     )
                     st.stop()
 
                 service = build("drive", "v3", credentials=creds, cache_discovery=False)
-                st.session_state["drive_client"] = DriveClient(service)
+                authed = AuthorizedSession(creds)
+                st.session_state["drive_client"] = DriveClient(service, authed_session=authed)
                 st.session_state["sa_email"] = info.get("client_email", "(unknown)")
+                st.session_state["chunk_bytes"] = int(chunk_mib) * 1024 * 1024
                 st.success(f"Authenticated as **{st.session_state['sa_email']}**")
             except Exception as e:
                 st.error(f"Failed to build Drive client: {e}")
@@ -315,6 +345,7 @@ if "drive_client" not in st.session_state:
     st.stop()
 
 client: DriveClient = st.session_state["drive_client"]
+chunk_bytes: int = st.session_state.get("chunk_bytes", 8 * 1024 * 1024)
 
 # ---------------------------
 # Folder selection
@@ -423,7 +454,7 @@ def convert_one(finfo: Dict[str, Any]) -> Row:
     dl_path = ""
     try:
         log_threadsafe(f"⬇️ Downloading: {fname}")
-        dl_path = client.download_to_temp(fid)
+        dl_path = client.download_to_temp(fid, chunk_bytes=chunk_bytes)
 
         log_threadsafe(f"🎛️ Converting: {fname}")
         stem = os.path.splitext(fname)[0]
@@ -503,8 +534,9 @@ render_logs()
 st.divider()
 with st.expander("ℹ️ Tips & Notes"):
     st.markdown("""
-- **This build has NO Domain-Wide Delegation.** You must **share** your Drive folders/files with the Service Account’s **client_email**.
-- Ensure **Google Drive API** is enabled in your GCP project.
-- App uses retries for transient Drive API errors and validates downloads to avoid feeding bad data to ffmpeg.
+- **No Domain-Wide Delegation**: Share your Drive folders/files with this Service Account’s **client_email** for access.
+- Ensure the **Google Drive API** is enabled in your GCP project.
+- Downloads use large streaming chunks and retry; you can tune chunk size at the top of the app.
 - FFmpeg is provided via `imageio-ffmpeg` (portable binary). No system install required.
+- If your platform shows native crashes, run with `--server.fileWatcherType=none` and keep `STREAMLIT_DATAFRAME_SERIALIZATION=legacy`.
 """)

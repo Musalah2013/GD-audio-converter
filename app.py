@@ -144,7 +144,8 @@ class DriveClient:
 
     def ensure_subfolder(self, parent_id: Optional[str], name: str) -> Optional[str]:
         """Create (or find) a subfolder under parent_id or root if None."""
-        q = f"mimeType='application/vnd.google-apps.folder' and trashed=false and name='{name.replace(\"'\",\"\\'\")}'"
+        safe_name = name.replace("'", "\\'")
+        q = f"mimeType='application/vnd.google-apps.folder' and trashed=false and name='{safe_name}'"
         if parent_id:
             q += f" and '{parent_id}' in parents"
         def list_op(page_token=None):

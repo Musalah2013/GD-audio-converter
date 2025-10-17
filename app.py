@@ -1,20 +1,25 @@
 
-# app_service_account_upload.py
-# Streamlit: Google Drive Audio Converter (Upload SA JSON per session)
+# app_service_account_upload_v2.py
+# Streamlit: Google Drive Audio Converter — Service Account JSON Upload (V2, refactored)
 #
-# - User uploads a Service Account JSON on each use (no secrets required)
-# - Optional Domain-Wide Delegation (checkbox + email field)
-# - No local FFmpeg install required (uses imageio-ffmpeg portable binary)
-# - Batch conversion with parallel workers, live progress, CSV report
+# Key improvements over previous version:
+# - Stronger structure: DriveClient class + Retry logic (exponential backoff) for 403/429/5xx
+# - Clear validation and actionable error messages
+# - Per-file live progress/status with concise event log
+# - Safer handling of uploaded JSON (in-memory only), no disk persistence by the app
+# - Optional creation of output subfolder inside selected output folder
+# - CSV summary with additional metrics (success %, total DL/UL size, total time)
 #
 import os
 import io
 import time
 import json
+import math
 import tempfile
 import logging
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
@@ -22,12 +27,21 @@ import pandas as pd
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
 
 import imageio_ffmpeg
 import subprocess
+import random
 
+# ---------------------------
+# Constants & Logging
+# ---------------------------
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+AUDIO_MIMES = [
+    "audio/mpeg","audio/wav","audio/aac","audio/ogg",
+    "audio/flac","audio/mp4","audio/x-wav","audio/x-ms-wma"
+]
 AUDIO_FORMATS = {
     "MP3":  {"ext": "mp3",  "mime": "audio/mpeg", "ffmpeg_args": ["-codec:a", "libmp3lame"]},
     "AAC":  {"ext": "aac",  "mime": "audio/aac",  "ffmpeg_args": ["-codec:a", "aac"]},
@@ -40,55 +54,22 @@ BITRATES = ["32", "64", "96", "128", "192", "256", "320"]
 SAMPLE_RATES = ["Auto", "22050", "32000", "44100", "48000"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("drive-audio-converter-upload")
-
-st.set_page_config(page_title="Drive Audio Converter (Upload SA)", page_icon="🗝️", layout="wide")
-st.title("🗝️ Google Drive Audio Converter — Upload Service Account JSON")
-st.caption("Upload a Google Service Account JSON on each session. No project secrets needed.")
+logger = logging.getLogger("drive-audio-converter-v2")
 
 # ---------------------------
-# Auth via uploaded SA JSON
+# Utilities
 # ---------------------------
-with st.expander("🔐 Upload Service Account JSON", expanded=True):
-    sa_file = st.file_uploader("Upload your Service Account JSON key", type=["json"])
-    use_dwd = st.checkbox("Use Domain‑Wide Delegation (impersonate a user)?", value=False,
-                          help="Requires Workspace admin configuration for DWD.")
-    subject = st.text_input("Impersonated user email (only if using DWD)", value="", disabled=not use_dwd)
-    build_client = st.button("Build Drive client", type="primary")
+def human_bytes(n: Optional[int]) -> str:
+    if not n or n < 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    f = float(n)
+    while f >= 1024 and i < len(units) - 1:
+        f /= 1024.0
+        i += 1
+    return f"{f:.2f} {units[i]}"
 
-def build_drive(sa_json_text: str, use_dwd: bool, subject: str):
-    try:
-        info = json.loads(sa_json_text)
-    except Exception as e:
-        st.error(f"Invalid JSON: {e}")
-        st.stop()
-    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-    if use_dwd:
-        if not subject.strip():
-            st.error("Please provide an email to impersonate when using DWD.")
-            st.stop()
-        creds = creds.with_subject(subject.strip())
-    svc = build("drive", "v3", credentials=creds, cache_discovery=False)
-    who = info.get("client_email", "(unknown)")
-    st.success(f"Authenticated with Service Account: **{who}**" + (f" — impersonating **{subject.strip()}**" if use_dwd else ""))
-    return svc
-
-if "drive" not in st.session_state and build_client:
-    if not sa_file:
-        st.error("Please upload a Service Account JSON first.")
-    else:
-        st.session_state["sa_json"] = sa_file.read().decode("utf-8")
-        st.session_state["drive"] = build_drive(st.session_state["sa_json"], use_dwd, subject)
-
-if "drive" not in st.session_state:
-    st.info("Upload your Service Account JSON and click **Build Drive client** to continue.")
-    st.stop()
-
-drive = st.session_state["drive"]
-
-# ---------------------------
-# Utility functions
-# ---------------------------
 def extract_folder_id(url_or_id: str) -> Optional[str]:
     s = (url_or_id or "").strip()
     if not s:
@@ -101,66 +82,7 @@ def extract_folder_id(url_or_id: str) -> Optional[str]:
         return s
     return None
 
-def is_folder(service, file_id: str) -> bool:
-    try:
-        meta = service.files().get(fileId=file_id, fields="id, mimeType", supportsAllDrives=True).execute()
-        return meta.get("mimeType") == "application/vnd.google-apps.folder"
-    except Exception as e:
-        logger.exception("is_folder error: %s", e)
-        return False
-
-def list_audio_files(service, folder_id: Optional[str]) -> List[Dict[str, Any]]:
-    audio_mimes = [
-        "audio/mpeg","audio/wav","audio/aac","audio/ogg",
-        "audio/flac","audio/mp4","audio/x-wav","audio/x-ms-wma"
-    ]
-    mime_query = " or ".join([f"mimeType='{m}'" for m in audio_mimes])
-    q = f"({mime_query}) and trashed=false"
-    params = {
-        "pageSize": 1000,
-        "fields": "nextPageToken, files(id, name, size, mimeType, parents)",
-        "supportsAllDrives": True,
-        "includeItemsFromAllDrives": True,
-        "q": q,
-    }
-    if folder_id:
-        params["q"] = f"{q} and '{folder_id}' in parents"
-
-    files = []
-    page_token = None
-    while True:
-        if page_token:
-            params["pageToken"] = page_token
-        resp = service.files().list(**params).execute()
-        files.extend(resp.get("files", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return files
-
-def human_bytes(n: Optional[int]) -> str:
-    if not n:
-        return "0 B"
-    units = ["B", "KB", "MB", "GB", "TB"]
-    i = 0
-    f = float(n)
-    while f >= 1024 and i < len(units) - 1:
-        f /= 1024.0
-        i += 1
-    return f"{f:.2f} {units[i]}"
-
-def download_to_temp(service, file_id: str) -> str:
-    req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-    tmp = tempfile.NamedTemporaryFile(delete=False, prefix="dl_", suffix=".bin")
-    fh = tmp.file
-    downloader = MediaIoBaseDownload(fh, req)
-    done = False
-    while not done:
-        status, done = downloader.next_chunk()
-    fh.close()
-    return tmp.name
-
-def ffmpeg_convert(in_path: str, out_path: str, bitrate_kbps: int, sample_rate: Optional[int], fmt_args: List[str]) -> bool:
+def ffmpeg_convert(in_path: str, out_path: str, bitrate_kbps: int, sample_rate: Optional[int], fmt_args: List[str]) -> Tuple[bool, str]:
     ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
     cmd = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", in_path]
     cmd.extend(fmt_args)
@@ -169,143 +91,374 @@ def ffmpeg_convert(in_path: str, out_path: str, bitrate_kbps: int, sample_rate: 
         cmd.extend(["-ar", str(sample_rate)])
     cmd.append(out_path)
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        return True
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return True, ""
     except subprocess.CalledProcessError as e:
         logger.error("ffmpeg failed: %s", e.stderr)
-        return False
-
-def upload_file(service, local_path: str, dest_name: str, mime_type: str, parent_id: Optional[str]) -> Optional[str]:
-    meta = {"name": dest_name}
-    if parent_id:
-        meta["parents"] = [parent_id]
-    media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
-    try:
-        file = service.files().create(
-            body=meta, media_body=media, fields="id", supportsAllDrives=True
-        ).execute()
-        return file.get("id")
-    except Exception as e:
-        logger.exception("Upload failed: %s", e)
-        return None
+        return False, e.stderr or "ffmpeg error"
 
 # ---------------------------
-# UI: Folders, Files, Settings
+# Drive Client with Retry
+# ---------------------------
+@dataclass
+class RetryPolicy:
+    max_attempts: int = 6
+    base_sleep: float = 0.8
+    jitter: float = 0.3
+
+class DriveClient:
+    def __init__(self, service, retry: RetryPolicy = RetryPolicy()):
+        self.service = service
+        self.retry = retry
+
+    def _with_retry(self, func, *args, **kwargs):
+        attempt = 0
+        while True:
+            try:
+                return func(*args, **kwargs)
+            except HttpError as e:
+                status = getattr(e, "status_code", None) or (e.resp.status if getattr(e, "resp", None) else None)
+                if status in (403, 429, 500, 502, 503, 504) and attempt < self.retry.max_attempts - 1:
+                    attempt += 1
+                    sleep_for = self.retry.base_sleep * (2 ** (attempt - 1))
+                    sleep_for *= 1 + random.uniform(-self.retry.jitter, self.retry.jitter)
+                    time.sleep(max(0.2, sleep_for))
+                    continue
+                raise
+            except Exception:
+                if attempt < self.retry.max_attempts - 1:
+                    attempt += 1
+                    time.sleep(self.retry.base_sleep * (2 ** (attempt - 1)))
+                    continue
+                raise
+
+    def is_folder(self, file_id: str) -> bool:
+        def op():
+            return self.service.files().get(fileId=file_id, fields="id, mimeType", supportsAllDrives=True).execute()
+        try:
+            meta = self._with_retry(op)
+            return meta.get("mimeType") == "application/vnd.google-apps.folder"
+        except Exception as e:
+            logger.exception("is_folder error: %s", e)
+            return False
+
+    def ensure_subfolder(self, parent_id: Optional[str], name: str) -> Optional[str]:
+        """Create (or find) a subfolder under parent_id or root if None."""
+        q = f"mimeType='application/vnd.google-apps.folder' and trashed=false and name='{name.replace(\"'\",\"\\'\")}'"
+        if parent_id:
+            q += f" and '{parent_id}' in parents"
+        def list_op(page_token=None):
+            return self.service.files().list(
+                q=q, pageSize=100, fields="nextPageToken, files(id, name)",
+                supportsAllDrives=True, includeItemsFromAllDrives=True,
+                pageToken=page_token
+            ).execute()
+        try:
+            page_token = None
+            while True:
+                resp = self._with_retry(list_op, page_token)
+                for f in resp.get("files", []):
+                    return f["id"]
+                page_token = resp.get("nextPageToken")
+                if not page_token:
+                    break
+            meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
+            if parent_id:
+                meta["parents"] = [parent_id]
+            def create_op():
+                return self.service.files().create(
+                    body=meta, fields="id", supportsAllDrives=True
+                ).execute()
+            res = self._with_retry(create_op)
+            return res.get("id")
+        except Exception as e:
+            logger.exception("ensure_subfolder error: %s", e)
+            return None
+
+    def list_audio_files(self, folder_id: Optional[str]) -> List[Dict[str, Any]]:
+        mime_query = " or ".join([f"mimeType='{m}'" for m in AUDIO_MIMES])
+        q = f"({mime_query}) and trashed=false"
+        if folder_id:
+            q += f" and '{folder_id}' in parents"
+        def list_op(page_token=None):
+            return self.service.files().list(
+                q=q, pageSize=1000,
+                fields="nextPageToken, files(id, name, size, mimeType, parents)",
+                supportsAllDrives=True, includeItemsFromAllDrives=True,
+                pageToken=page_token
+            ).execute()
+        files = []
+        try:
+            page_token = None
+            while True:
+                resp = self._with_retry(list_op, page_token)
+                files.extend(resp.get("files", []))
+                page_token = resp.get("nextPageToken")
+                if not page_token:
+                    break
+        except Exception as e:
+            logger.exception("list_audio_files error: %s", e)
+        return files
+
+    
+def download_to_temp(self, file_id: str) -> str:
+    """
+    Download file to a NamedTemporaryFile and return its path.
+    - Sets acknowledgeAbuse=True to allow downloading flagged binaries (common for media).
+    - Verifies non-empty result.
+    - Detects obvious HTML/JSON error payloads to surface permission/abuse issues.
+    - Retries with exponential backoff via _with_retry.
+    """
+    req = self.service.files().get_media(fileId=file_id, supportsAllDrives=True, acknowledgeAbuse=True)
+    tmp = tempfile.NamedTemporaryFile(delete=False, prefix="dl_", suffix=".bin")
+    fh = tmp.file
+    downloader = MediaIoBaseDownload(fh, req, chunksize=2 * 1024 * 1024)
+    done = False
+    last_status = None
+    while not done:
+        def next_chunk():
+            return downloader.next_chunk()
+        last_status, done = self._with_retry(next_chunk)
+    fh.flush(); fh.close()
+
+    # Validate non-empty
+    if not os.path.exists(tmp.name) or os.path.getsize(tmp.name) <= 0:
+        raise RuntimeError("Download produced an empty file. Check permissions or file health.")
+
+    # Heuristic: detect HTML/JSON error payload (instead of audio bytes)
+    with open(tmp.name, "rb") as f:
+        head = f.read(1024).strip().lower()
+    if head.startswith(b'<!doctype html') or head.startswith(b'<html') or head.startswith(b'{') or head.startswith(b'['):
+        raise RuntimeError("Downloaded content is not audio (looks like an error page or JSON). The Service Account may lack access to the file content.")
+
+    return tmp.name
+
+    def upload_file(self, local_path: str, dest_name: str, mime_type: str, parent_id: Optional[str]) -> Optional[str]:
+        meta = {"name": dest_name}
+        if parent_id:
+            meta["parents"] = [parent_id]
+        media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
+        def create_op():
+            return self.service.files().create(
+                body=meta, media_body=media, fields="id", supportsAllDrives=True
+            ).execute()
+        try:
+            res = self._with_retry(create_op)
+            return res.get("id")
+        except Exception as e:
+            logger.exception("upload_file error: %s", e)
+            return None
+
+# ---------------------------
+# Streamlit UI
+# ---------------------------
+st.set_page_config(page_title="Drive Audio Converter (Upload SA v2)", page_icon="🗝️", layout="wide")
+st.title("🗝️ Google Drive Audio Converter — Upload Service Account JSON (v2)")
+st.caption("Upload a Service Account key each session. No local installs. No secrets file.")
+
+with st.expander("🔐 Upload Service Account JSON", expanded=True):
+    sa_file = st.file_uploader("Service Account JSON key", type=["json"])
+    use_dwd = st.checkbox("Use Domain‑Wide Delegation (impersonate a user)?", value=False,
+                          help="Requires Workspace admin configuration for DWD.")
+    subject = st.text_input("Impersonated user email (only if using DWD)", value="", disabled=not use_dwd)
+    if st.button("Build Drive client", type="primary"):
+        if not sa_file:
+            st.error("Please upload a Service Account JSON file.")
+        else:
+            try:
+                info = json.loads(sa_file.read().decode("utf-8"))
+                creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+                if use_dwd:
+                    if not subject.strip():
+                        st.error("Provide an email to impersonate when using DWD.")
+                        st.stop()
+                    creds = creds.with_subject(subject.strip())
+                service = build("drive", "v3", credentials=creds, cache_discovery=False)
+                st.session_state["drive_client"] = DriveClient(service)
+                st.session_state["sa_email"] = info.get("client_email", "(unknown)")
+                st.session_state["impersonated"] = subject.strip() if use_dwd else None
+                st.success(f"Authenticated as **{st.session_state['sa_email']}**" + (f" — impersonating **{st.session_state['impersonated']}**" if use_dwd else ""))
+            except Exception as e:
+                st.error(f"Failed to build Drive client: {e}")
+
+if "drive_client" not in st.session_state:
+    st.info("Upload your Service Account JSON and click **Build Drive client** to continue.")
+    st.stop()
+
+client: DriveClient = st.session_state["drive_client"]
+
+# ---------------------------
+# Folder selection
 # ---------------------------
 st.subheader("📁 Choose Input & Output Folders")
-c1, c2 = st.columns(2)
-with c1:
-    input_url = st.text_input("Input Folder URL or ID (must be accessible to this SA or the impersonated user)")
+left, right = st.columns(2)
+with left:
+    input_url = st.text_input("Input Folder URL or ID (must be accessible to this SA / impersonated user)")
     input_id = extract_folder_id(input_url) if input_url.strip() else None
     if input_id:
-        if is_folder(drive, input_id):
+        if client.is_folder(input_id):
             st.success("Valid input folder.")
         else:
             st.error("Provided input is not a folder or not accessible.")
             input_id = None
-with c2:
+with right:
     output_url = st.text_input("Output Folder URL or ID (leave blank to save in Drive root)")
     output_id = extract_folder_id(output_url) if output_url.strip() else None
     if output_id:
-        if is_folder(drive, output_id):
+        if client.is_folder(output_id):
             st.success("Valid output folder.")
         else:
             st.error("Provided output is not a folder or not accessible.")
             output_id = None
 
+subfolder_name = st.text_input("(Optional) Create or use subfolder inside the output folder", value="")
+if subfolder_name and output_id:
+    if st.button("Ensure output subfolder exists / select it"):
+        sub_id = client.ensure_subfolder(output_id, subfolder_name.strip())
+        if sub_id:
+            output_id = sub_id
+            st.success(f"Using output subfolder: {subfolder_name.strip()}")
+        else:
+            st.error("Could not create or select the subfolder.")
+
+# ---------------------------
+# File listing & selection
+# ---------------------------
 st.subheader("🎵 Select Files to Convert")
-files = list_audio_files(drive, input_id)
+files = client.list_audio_files(input_id)
 if not files:
-    st.warning("No audio files found. Ensure the folder is shared with the Service Account or that DWD is correctly configured.")
+    st.warning("No audio files found. Ensure the folder is shared with the Service Account (or DWD is configured).")
     selected_files = []
 else:
     labels = [f"{f['name']}  ({human_bytes(int(f.get('size', 0) or 0))})" for f in files]
-    default_all = st.checkbox("Select all", value=False)
+    select_all = st.checkbox("Select all", value=False)
     selected_flags = st.multiselect(
         "Pick files to convert:",
         options=list(range(len(files))),
-        default=list(range(len(files))) if default_all else [],
+        default=list(range(len(files))) if select_all else [],
         format_func=lambda i: labels[i],
     )
     selected_files = [files[i] for i in selected_flags]
     st.caption(f"Selected {len(selected_files)} / {len(files)}")
 
+# ---------------------------
+# Conversion settings
+# ---------------------------
 st.subheader("⚙️ Conversion Settings")
-d1, d2, d3, d4 = st.columns([1,1,1,1])
-with d1:
+c1, c2, c3, c4 = st.columns([1,1,1,1])
+with c1:
     out_fmt = st.selectbox("Format", list(AUDIO_FORMATS.keys()), index=0)
-with d2:
+with c2:
     bitrate = st.selectbox("Bitrate (kbps)", BITRATES, index=3)
-with d3:
+with c3:
     sr_str = st.selectbox("Sample rate", SAMPLE_RATES, index=3)
     sr = int(sr_str) if sr_str.isdigit() else None
-with d4:
+with c4:
     max_threads = st.slider("Parallel workers", min_value=1, max_value=os.cpu_count() or 4, value=2)
 
 # ---------------------------
-# Run conversion
+# Conversion runner
 # ---------------------------
 st.subheader("🚀 Run")
-result_placeholder = st.empty()
+overall_placeholder = st.empty()
 table_placeholder = st.empty()
-report_download_placeholder = st.empty()
+log_box = st.expander("Live log", expanded=False)
+report_placeholder = st.empty()
 
-def convert_one(finfo: Dict[str, Any]) -> Dict[str, Any]:
+def log(msg: str):
+    with log_box:
+        st.write(f"{datetime.now().strftime('%H:%M:%S')} — {msg}")
+
+from dataclasses import dataclass
+@dataclass
+class Row:
+    id: str
+    name: str
+    status: str
+    download_size: int
+    upload_size: int
+    duration_s: float
+    error: str = ""
+
+def convert_one(finfo: Dict[str, Any]) -> Row:
     t0 = time.time()
     fid = finfo["id"]
     fname = finfo["name"]
     orig_size = int(finfo.get("size", 0) or 0)
+    if orig_size <= 0:
+        return Row(finfo["id"], finfo["name"], "Skipped (empty size)", 0, 0, 0.0, "Drive reported size=0; cannot convert.")
     dl_path = ""
     try:
-        dl_path = download_to_temp(drive, fid)
+        log(f"⬇️ Downloading: {fname}")
+        dl_path = client.download_to_temp(fid)
+
+        log(f"🎛️ Converting: {fname}")
         stem = os.path.splitext(fname)[0]
-        target = os.path.join(tempfile.gettempdir(), f"{stem}_converted.{AUDIO_FORMATS[out_fmt]['ext']}")
-        ok = ffmpeg_convert(dl_path, target, int(bitrate), sr, AUDIO_FORMATS[out_fmt]["ffmpeg_args"])
+        out_ext = AUDIO_FORMATS[out_fmt]["ext"]
+        target = os.path.join(tempfile.gettempdir(), f"{stem}_converted.{out_ext}")
+        ok, err = ffmpeg_convert(dl_path, target, int(bitrate), sr, AUDIO_FORMATS[out_fmt]["ffmpeg_args"])
         if not ok:
-            return {"id": fid, "name": fname, "status": "Conversion Failed",
-                    "download_size": orig_size, "upload_size": 0, "duration_s": time.time() - t0}
+            return Row(fid, fname, "Conversion Failed", orig_size, 0, time.time() - t0, err)
+
         up_size = os.path.getsize(target)
-        new_name = f"{stem}_converted.{AUDIO_FORMATS[out_fmt]['ext']}"
-        uploaded_id = upload_file(drive, target, new_name, AUDIO_FORMATS[out_fmt]["mime"], output_id)
+        new_name = f"{stem}_converted.{out_ext}"
+        log(f"⬆️ Uploading: {new_name}")
+        uploaded_id = client.upload_file(target, new_name, AUDIO_FORMATS[out_fmt]["mime"], output_id)
         if not uploaded_id:
-            return {"id": fid, "name": fname, "status": "Upload Failed",
-                    "download_size": orig_size, "upload_size": up_size, "duration_s": time.time() - t0}
-        return {"id": fid, "name": fname, "status": "Success",
-                "download_size": orig_size, "upload_size": up_size, "duration_s": time.time() - t0}
+            return Row(fid, fname, "Upload Failed", orig_size, up_size, time.time() - t0, "Upload error")
+        return Row(fid, fname, "Success", orig_size, up_size, time.time() - t0, "")
     except Exception as e:
-        return {"id": fid, "name": fname, "status": f"Error: {e}",
-                "download_size": orig_size, "upload_size": 0, "duration_s": time.time() - t0}
+        return Row(fid, fname, f"Error", orig_size, 0, time.time() - t0, str(e))
     finally:
         if dl_path and os.path.exists(dl_path):
-            try: os.remove(dl_path)
-            except Exception: pass
+            try:
+                os.remove(dl_path)
+            except Exception:
+                pass
 
 if st.button("Start conversion", type="primary", disabled=not selected_files):
     total = len(selected_files)
     if total == 0:
         st.warning("Please select at least one file.")
     else:
-        st.success(f"Starting conversion of {total} files...")
-        overall = st.progress(0, text="Starting...")
-        rows: List[Dict[str, Any]] = []
+        overall = st.progress(0.0, text="Starting...")
+        rows: List[Row] = []
+        success_count = 0
+        total_dl = 0
+        total_ul = 0
+        t_all = time.time()
+
         with ThreadPoolExecutor(max_workers=max_threads) as ex:
             futures = [ex.submit(convert_one, f) for f in selected_files]
             done_count = 0
             for fut in as_completed(futures):
-                res = fut.result()
-                rows.append(res)
+                r = fut.result()
+                rows.append(r)
                 done_count += 1
+                success_count += 1 if r.status == "Success" else 0
+                total_dl += r.download_size
+                total_ul += r.upload_size
                 overall.progress(done_count/total, text=f"Processed {done_count}/{total}")
-                df = pd.DataFrame(rows).assign(
-                    download = lambda d: d["download_size"].map(human_bytes),
-                    upload   = lambda d: d["upload_size"].map(human_bytes),
-                    time_s   = lambda d: d["duration_s"].map(lambda x: f"{x:.2f}")
-                )[["name","status","download","upload","time_s"]]
-                table_placeholder.dataframe(df, use_container_width=True)
-        succ = sum(1 for r in rows if r["status"] == "Success")
-        result_placeholder.success(f"Complete: {succ}/{total} succeeded.")
-        csv = pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
-        report_download_placeholder.download_button(
+                df = pd.DataFrame([
+                    {"name": x.name, "status": x.status,
+                     "download": human_bytes(x.download_size),
+                     "upload": human_bytes(x.upload_size),
+                     "time_s": f"{x.duration_s:.2f}",
+                     "error": x.error}
+                for x in rows])
+                table_placeholder.dataframe(df, width='stretch')
+
+        elapsed = time.time() - t_all
+        pct = (success_count / total * 100.0) if total else 0.0
+        summary = f"Complete: {success_count}/{total} succeeded ({pct:.1f}%). DL {human_bytes(total_dl)} | UL {human_bytes(total_ul)} | Time {elapsed:.2f}s"
+        overall_placeholder.success(summary)
+
+        csv = pd.DataFrame([{
+            "id": x.id, "name": x.name, "status": x.status,
+            "download_size": x.download_size, "upload_size": x.upload_size,
+            "duration_s": f"{x.duration_s:.2f}", "error": x.error
+        } for x in rows]).to_csv(index=False).encode("utf-8")
+        report_placeholder.download_button(
             "Download CSV report",
             data=csv,
             file_name=f"conversion_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
@@ -315,8 +468,9 @@ if st.button("Start conversion", type="primary", disabled=not selected_files):
 st.divider()
 with st.expander("ℹ️ Tips & Notes"):
     st.markdown("""
-- **Upload SA JSON**: The key is held in memory for this session only; it is **not** written to disk by the app.
-- **Domain-Wide Delegation**: Tick the checkbox and provide an email to impersonate. Requires Workspace DWD configuration.
-- **Shared Drives**: Make sure the SA (or impersonated user) has access to those folders.
-- **No local FFmpeg**: Uses `imageio-ffmpeg` for a portable binary.
+- **Upload SA JSON**: Key is used in-memory for this session only.
+- **DWD**: If your Workspace admin enabled **Domain‑Wide Delegation**, provide the email to impersonate.
+- **Shared Drives**: Ensure the SA (or impersonated user) has permissions on the specific drive/folder.
+- **Retries**: The app retries transient Drive API errors (403/429/5xx) with exponential backoff.
+- **FFmpeg**: Uses a portable binary via `imageio-ffmpeg`. No system install required.
 """)

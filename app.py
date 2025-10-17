@@ -23,7 +23,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import os
+os.environ["STREAMLIT_DATAFRAME_SERIALIZATION"] = "legacy"  # avoid importing pyarrow
 import streamlit as st
 import pandas as pd
 
